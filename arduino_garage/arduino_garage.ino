@@ -26,7 +26,7 @@ void setup()
   
   RS485Serial.begin(9600);   // set the data rate 
 
-  rs485DOM = new RS485Dom(&RS485Serial, Pin13LED, Pin13LED, PinRS485TXControl);
+  rs485DOM = new RS485Dom('G', &RS485Serial, Pin13LED, Pin13LED, PinRS485TXControl);
 
   rs485DOM->sendStartupMesssage();
 

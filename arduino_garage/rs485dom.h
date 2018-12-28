@@ -1,7 +1,7 @@
 /**
  * @file      rs485dom.h
  * @version   1.0
- * @date      2018.07.08
+ * @date      2018.12.24
  * @author    Rafal Bednarz
  * @contact   arduino@rbednarz.pl
  * 
@@ -47,18 +47,18 @@
  *  It has been tested with Raspberry PI (using USB-RS485 with CH341 module).
  */
 
-
+#define DEBUG
 
 
 enum RS485 {
   RS485_MAX_LINE_LENGTH           = 250,  // Maximum line length. Package will be dropped with ERR_LINE_OVERFLOW error.
   RS485_MAX_NAMEFIELD_LENGTH      = 20,   // Maximum character count for "name" field in package. Please remember to add \0 char at the end.
-  RS485_MIN_LINE_LENGTH           = 18,   // Minimum line length for input. Package with less characters will be dropped with ERR_LINE_TOO_SHORT error
+  RS485_MIN_LINE_LENGTH           = 16,   // Minimum line length for input. Package with less characters will be dropped with ERR_LINE_TOO_SHORT error
   RS485_MAX_RETRIES               = 10,   // How many times package with ackRequired bit set will be send and arduino will wait for acknowledgement. Afterwards it is assumed that packed has been delivered (no more tries).
-  RS485_HEARTBEAT_DURATION        = 10,   // Duration beetween heartbeat.
+  RS485_HEARTBEAT_DURATION        = 60,   // Duration beetween heartbeat [s].
   RS485_QUEUE_SIZE                = 3,    // Output queue size (stack). Every message is stored in queue and dequeue() method pulls from the stack and send. ERR_QUEUE_OVERFLOW will be returned if there is no space in stack.
-  RS485_MAX_INPUT_TIME            = 1000, // All parts (characters) of incoming message must be delivered in specified time. Check code for details.
-  RS485_PIN_ACTIVITY_IN_DURATION  = 50    // Defines how long LED for incoming characters must be turned on
+  RS485_MAX_INPUT_TIME            = 1,    // All parts (characters) of incoming message must be delivered in specified time [s]. Check code for details.
+  RS485_PIN_ACTIVITY_IN_DURATION  = 50    // Defines how long LED for incoming characters must be turned on [ms]
 };
 
 
@@ -112,10 +112,12 @@ enum RS485_PROCESS_CODES {
   ERR_WRONG_CRC      = 50,  // Package contains wrong CRC
   ERR_ACK_REQUIRED   = 60,  // ACK expected but other package came
   ERR_WRONG_ACK      = 61,  // ACK delivered but for wrong package than we expected
+  ERR_SET_HANDLER    = 62,  // if SET handler could not perform operation - it means that 'set' command has not been executed properly
   ERR_QUEUE_OVERFLOW = 70   // No space in output queue
 
   
 };
+
 
 /**
  * RS485Dom (House) class
@@ -125,6 +127,11 @@ class RS485Dom {
   private:
 
     SoftwareSerial *port = NULL;
+
+    /**
+     * Global system identifier
+     */
+    char systemName;
 
     /**
      * LED indicator for input data
@@ -198,6 +205,7 @@ class RS485Dom {
      */
     uint32_t inputTimeout = 0;
 
+    bool(*commandSETHandlerFunction)(RS485message *m);
 
     uint8_t CRCiterate(char *ptr, uint8_t *c);
     uint8_t packageChecksum(RS485message *p);
@@ -220,11 +228,21 @@ class RS485Dom {
 
     int freeRam ();
 
+    void cleanOutMessageQueue();
+
+    
+    
+
     
   public:
-    RS485Dom(SoftwareSerial *serial, uint8_t _activityPINin, uint8_t _activityPINout, uint8_t _directionControlPIN);
+    RS485Dom(char _systemName, SoftwareSerial *serial, uint8_t _activityPINin, uint8_t _activityPINout, uint8_t _directionControlPIN);
 
     void sendStartupMesssage();
+
+    void sendKONTRMessage(uint32_t kontr_code);
+
+    void setCommandSETHandler(bool(*function)(RS485message *m));
+    
 
     uint8_t loop();
 
@@ -234,9 +252,17 @@ class RS485Dom {
  * Main constructor.
  *  serial - could be NULL - than Hardware "Serial" will used
  */
-RS485Dom::RS485Dom(SoftwareSerial *serial, uint8_t _activityPINin, uint8_t _activityPINout, uint8_t _directionControlPIN) {
+RS485Dom::RS485Dom(char _systemName, SoftwareSerial *serial, uint8_t _activityPINin, uint8_t _activityPINout, uint8_t _directionControlPIN) {
   
   port = serial;
+
+  #ifdef DEBUG_PORT_OVERRIDE
+    port = NULL; //to tylko dla testow - wtedy przyjmuje dane ze zwyklego portu
+  #endif
+
+  systemName = _systemName;
+
+  
   activityPINin = _activityPINin;
   activityPINout = _activityPINout;
   directionControlPIN = _directionControlPIN;
@@ -335,7 +361,9 @@ int8_t RS485Dom::processData()
   char hash[2]  = "#";
   uint8_t countedCRC;
 
-  Serial.print(F("#G: "));
+  Serial.print(F("#"));
+  Serial.print(systemName);
+  Serial.print(": ");
   Serial.println(ioBuffer);
   
 
@@ -347,7 +375,8 @@ int8_t RS485Dom::processData()
     return ERR_PARSE_FIELD1;
   }
 
-  if (strcmp(inMessage.system, ">G") != 0) 
+  char s[] = {'>', systemName, 0};
+  if (strcmp(inMessage.system, s) != 0) 
     return NOT_FOR_ME;
   
   token = strtok(NULL, comma);
@@ -410,11 +439,9 @@ int8_t RS485Dom::processData()
 //  Serial.println(inMessage.name);
 //  Serial.println(inMessage.value);
 //  Serial.println(inMessage.opt);
-//
 //  Serial.println(inMessage.counter);
 //  Serial.println(inMessage.retry);
 //  Serial.println(inMessage.crc);
-
 #endif
 
   if (inMessage.crc != countedCRC) {
@@ -441,6 +468,14 @@ int8_t RS485Dom::processData()
       return ERR_WRONG_ACK;
 
     case COMMAND_SET:
+
+      // perform operation
+      if (commandSETHandlerFunction)  {
+        if (! commandSETHandlerFunction(&inMessage)) {
+          return ERR_SET_HANDLER;
+        }
+      }
+      
       sendACKmessage();
       break;
 
@@ -479,7 +514,7 @@ int8_t RS485Dom::readFromPort()
   uint8_t result = LINE_STILL_READING;
 
 
-  if (ioBufferIdx > 0 && ((millis() - inputTimeout) > RS485_MAX_INPUT_TIME)) { // if character has been delivered after RS485_MAX_INPUT_TIME milliseconds after previous - let's start from the beginning
+  if (ioBufferIdx > 0 && ((millis() - inputTimeout) > RS485_MAX_INPUT_TIME*1000)) { // if character has been delivered after RS485_MAX_INPUT_TIME milliseconds after previous - let's start from the beginning
       ioBufferIdx = 0;
       ioBuffer[0] = 0;
   }
@@ -552,7 +587,9 @@ void RS485Dom::sendACKmessage()
 {
   
   inMessage.command = COMMAND_ACK;
-  strcpy(inMessage.system, "<G");
+
+  char s[] = {'<', systemName, 0};
+  strcpy(inMessage.system, s);
   inMessage.value = inMessage.counter;
   inMessage.counter = getNextGlobalCounter();
 
@@ -580,14 +617,18 @@ uint16_t RS485Dom::getNextGlobalCounter() {
 void RS485Dom::sendMessage()
 {
 
-  outMessage[outMessageIdx].crc = packageChecksum(&outMessage[outMessageIdx]);
+  if (outMessageIdx < 0) {
+    return;
+  }
+
+  outMessage[0].crc = packageChecksum(&outMessage[0]);
 
   lastMessageMillis = millis();
 
-  doSendMessage(&(outMessage[outMessageIdx]));
+  doSendMessage(&(outMessage[0]));
 
-  if (false == outMessage[outMessageIdx].ackRequired)
-    outMessageIdx--; //jezeli nie wymagamy ack to decrementujemy ilosc w kolejce po wyslaniu
+  if (false == outMessage[0].ackRequired)
+    outMessage[0].command = COMMAND_DELME;  //jezeli nie wymagamy ack to oznaczamy do usuniecia
 
 
 }
@@ -596,7 +637,9 @@ void RS485Dom::sendQueueOverflowErrorMessage()
 {
 
   inMessage.command = COMMAND_ERROR;
-  strcpy(inMessage.system, "<G");
+ 
+  char s[] = {'<', systemName, 0};
+  strcpy(inMessage.system, s);
   strcpy(inMessage.name, "queueoverflow");
   inMessage.value = ERR_QUEUE_OVERFLOW;
   inMessage.opt = RS485_QUEUE_SIZE;
@@ -617,7 +660,9 @@ void RS485Dom::sendErrorMessage(uint8_t errCode)
 {
 
   inMessage.command = COMMAND_ERROR;
-  strcpy(inMessage.system, "<G");
+  
+  char s[] = {'<', systemName, 0};
+  strcpy(inMessage.system, s);
   inMessage.value = errCode;
   inMessage.opt = 0;
   inMessage.retry = 0;
@@ -627,6 +672,15 @@ void RS485Dom::sendErrorMessage(uint8_t errCode)
   inMessage.crc = packageChecksum(&inMessage);
 
   doSendMessage(&inMessage);  
+}
+
+
+void RS485Dom::sendKONTRMessage(uint32_t kontr_code) 
+{
+
+  char cmd[] = "K";
+  addToSendQueue(COMMAND_NOTIFY, cmd, kontr_code, 0, true);  
+  
 }
 
 /**
@@ -663,7 +717,9 @@ uint8_t RS485Dom::loop()
  
   }
 
-  if ((millis() - lastHBMillis) > (RS485_HEARTBEAT_DURATION*1000)) {
+  
+
+  if (((millis() - lastHBMillis)/1000) > (RS485_HEARTBEAT_DURATION)) {
     lastHBMillis = millis();
     sendHeartbeatMessage();
   }
@@ -680,8 +736,9 @@ uint8_t RS485Dom::loop()
     case ERR_WRONG_CRC:
     case ERR_ACK_REQUIRED:
     case ERR_WRONG_ACK:
+    case ERR_SET_HANDLER:
       sendErrorMessage(r);
-      break;    
+      break;
   }
 
   return r;
@@ -689,9 +746,19 @@ uint8_t RS485Dom::loop()
   
 }
 
+
+void RS485Dom::setCommandSETHandler(bool(*func)(RS485message *m)) {
+
+  commandSETHandlerFunction = func;
+
+}
+
+
+
 void RS485Dom::sendStartupMesssage() {
 
-  addToSendQueue(COMMAND_INFO, "start", 0, 0, false);
+  char cmd[] = "start";
+  addToSendQueue(COMMAND_INFO, cmd, 0, 0, false);
  
 }
 
@@ -699,7 +766,8 @@ void RS485Dom::sendStartupMesssage() {
 
 void RS485Dom::sendHeartbeatMessage() {
 
-  addToSendQueue(COMMAND_INFO, "hb", lastHBMillis/1000, freeRam(), false);
+  char cmd[] = "hb";
+  addToSendQueue(COMMAND_INFO, cmd, lastHBMillis/1000, freeRam(), false);
   
 }
 
@@ -708,35 +776,38 @@ void RS485Dom::sendHeartbeatMessage() {
  */
 void RS485Dom::sendWaterTrigger() {
 
-  addToSendQueue(COMMAND_NOTIFY, "water", 1, 0, true);
+  char cmd[] = "water";
+  addToSendQueue(COMMAND_NOTIFY, cmd, 1, 0, true);
 
 }
 
 void RS485Dom::dequeue()
 {
 
+//  if (COMMAND_DELME == outMessage[outMessageIdx].command) {
+//    outMessageIdx--;
+//    return;
+//  }
+
+  cleanOutMessageQueue();
+
   if (outMessageIdx < 0)
     return;
 
-  if (COMMAND_DELME == outMessage[outMessageIdx].command) {
-    outMessageIdx--;
-    return;
-  }
-    
-
+//  Serial.println(outMessageIdx);
   
-  switch (outMessage[outMessageIdx].ackRequired) { //dotyczy ostatniej wiadomosci:
+  switch (outMessage[0].ackRequired) { //dotyczy ostatniej wiadomosci:
     case true: //jezeli czekamy na ack'a i nie dostalismy go w ciagu ostatnich X milisekund - to ponow wysylke
       if ((millis() - lastMessageMillis) > 1000) {
 
         // increments retry counter of last message
-        outMessage[outMessageIdx].retry++ ;
+        outMessage[0].retry++ ;
 
-        if (outMessage[outMessageIdx].retry >= RS485_MAX_RETRIES) { 
+        if (outMessage[0].retry >= RS485_MAX_RETRIES) { 
           // assume that message has been delivered if ACK has not been sent so far.
           // TODO: maybe some LED should be turn on in this situation?
           
-          outMessageIdx--; // pop from the stack
+          outMessage[0].command = COMMAND_DELME;
           return ; // no more tries
         }
       
@@ -763,6 +834,19 @@ void RS485Dom::dequeue()
 void RS485Dom::addToSendQueue(char command, char* name, uint32_t value, uint32_t opt, bool ackRequired)
 {
 
+#ifdef DEBUG
+  Serial.print(F("#Add2queue: "));
+  Serial.print(command);
+  Serial.print(" ");
+  Serial.print(name);
+  Serial.print(" ");
+  Serial.print(value);
+  Serial.print(" ");
+  Serial.println(opt);
+
+  
+#endif
+  
   if (outMessageIdx + 1 >=  RS485_QUEUE_SIZE) {
     Serial.println(F("KOLEJKA PRZEKROCZONA"));
 
@@ -773,7 +857,8 @@ void RS485Dom::addToSendQueue(char command, char* name, uint32_t value, uint32_t
     
   outMessageIdx++;
 
-  strcpy(outMessage[outMessageIdx].system, "<G");
+  char s[] = {'<', systemName, 0};
+  strcpy(outMessage[outMessageIdx].system, s);
   outMessage[outMessageIdx].command = command;
   strcpy(outMessage[outMessageIdx].name, name);
   outMessage[outMessageIdx].value = value;
@@ -790,7 +875,8 @@ void RS485Dom::addToSendQueue(char command, char* name, uint32_t value, uint32_t
  */
 void RS485Dom::sendTemperature() {
 
-  addToSendQueue(COMMAND_INFO, "tempout", 31, 7, false);
+  char cmd[] = "tempout";
+  addToSendQueue(COMMAND_INFO, cmd, 31, 7, false);
   
 }
 
@@ -803,4 +889,38 @@ int RS485Dom::freeRam () {
    return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
 }
 
+/**
+ * Clean out message queue. All "COMMAND_DELME" entries are being removed.
+ * It is required to make queue FIFO
+ */
+void RS485Dom::cleanOutMessageQueue()
+{
+  uint8_t newIdx = -1;
+
+  for (uint8_t i=0; i <= outMessageIdx; i++) {
+
+    if (COMMAND_DELME == outMessage[i].command) {
+      for (uint8_t j=i+1; j<=outMessageIdx; j++) {
+
+        if (COMMAND_DELME != outMessage[j].command) {
+
+
+          memcpy(&outMessage[i], &outMessage[j], sizeof(RS485message));
+
+          outMessage[j].command = COMMAND_DELME;
+          newIdx = i;
+          break;
+        }
+        
+      }
+    } else {
+      newIdx = i;
+    }
+    
+  }
+
+  outMessageIdx = newIdx;
+
+ 
+}
 
